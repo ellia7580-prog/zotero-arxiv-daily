@@ -12,6 +12,7 @@ from queue import Empty
 from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
+from datetime import datetime, timedelta, timezone
 
 T = TypeVar("T")
 
@@ -114,31 +115,61 @@ class ArxivRetriever(BaseRetriever):
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
         client = arxiv.Client(num_retries=10, delay_seconds=10)
+    
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
+    
+        # Debug/test mode: query recent arXiv papers by submittedDate instead of RSS.
+        # This avoids "No arxiv papers found" on weekends or days without RSS updates.
+        lookback_days = self.config.source.arxiv.get("lookback_days", None)
+        if self.config.executor.debug and lookback_days:
+            end = datetime.now(timezone.utc)
+            start = end - timedelta(days=int(lookback_days))
+    
+            date_query = f"submittedDate:[{start:%Y%m%d%H%M} TO {end:%Y%m%d%H%M}]"
+            cat_query = " OR ".join(
+                [f"cat:{category}" for category in self.config.source.arxiv.category]
+            )
+    
+            search_query = f"({cat_query}) AND {date_query}"
+            logger.info(f"Debug lookback mode enabled. arXiv query: {search_query}")
+    
+            search = arxiv.Search(
+                query=search_query,
+                max_results=10,
+                sort_by=arxiv.SortCriterion.SubmittedDate,
+                sort_order=arxiv.SortOrder.Descending,
+            )
+            return list(client.results(search))
+    
         # Get the latest paper from arxiv rss feed
         feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
         if 'Feed error for query' in feed.feed.title:
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
+    
         raw_papers = []
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
+    
         all_paper_ids = [
             i.id.removeprefix("oai:arXiv.org:")
             for i in feed.entries
             if i.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
+    
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
-
+    
         # Get full information of each paper from arxiv api
         bar = tqdm(total=len(all_paper_ids))
+    
         for i in range(0, len(all_paper_ids), 20):
             search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
             batch = list(client.results(search))
             bar.update(len(batch))
             raw_papers.extend(batch)
+    
         bar.close()
-
+    
         return raw_papers
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
